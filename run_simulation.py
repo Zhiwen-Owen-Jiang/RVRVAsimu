@@ -3,681 +3,424 @@ import re
 import traceback
 import time
 import argparse
-import h5py
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-from functools import reduce
-from scipy.stats import chi2, cauchy, beta
+from scipy.sparse import load_npz
 
 import utils.dataset as ds
 from utils.relatedness import LOCOpreds
 from utils.null import NullModel
-from utils.utils import GetLogger, sec_to_str
-from utils.pvalue import saddle
-from utils.utils import PermDistribution
+from utils.vsettest import VariantSetTest
+from utils.utils import *
 
 
+"""
+type I error:
+1. load raw genotype data by each chr
+2. generate genes for each cMAC bin from chrs by proportion
+3. count false positives at 2.5e-6
 
-class VariantSetTest:
-    def __init__(self, bases, var, perm):
-        """
-        Variant set test for rare variants
+power:
+1. load raw genotype data by each chr
+2. generate gene for each cMAC bin using causal index for each chr
+3. count true positives at 2.5e-6
 
-        Parameters:
-        ------------
-        bases: (N, r) np.array, functional bases
-        resid_ldr: (n, r) np.array, LDR residuals
-        var: (N, ) np.array, voxel variance
-        perm: an instance of PermDistribution
+"""
 
-        """
-        self.bases = bases
-        self.var = var
-        self.N = bases.shape[0]
-        self.perm = perm
 
-    def input_vset(self, vset, maf, is_rare, annotation_pred=None, annot_transform=True):
-        """
-        Inputing variant set and computing half scores and covariance matrix
+class RVsimulation:
+    """
+    Doing simulation for RVRVA
 
-        Parameters:
-        ------------
-        vset: (n, m) BlockMatrix with alleles flipped and variants filtered.
-            It should include only variants of a specific category or in a small window,
-            not the entire gene. Otherwise, there might be OOM issue.
-        maf: (m, ) np.array of MAF
-        is_rare: (m, ) np.array boolean index indicating MAC < mac_threshold
-        annotation_pred: (m, q) np.array of functional annotation or None
-        annot_transform: if transforming FAVOR annotations to rank
+    """
 
-        """
-        self.maf = maf
-        self.is_rare = is_rare
-        vset = vset.T
-        vset_covar = vset @ self.covar  # Z'X, (m, p)
-        inner_vset = vset @ vset.T  # Z'Z, (m, m)
-        half_ldr_score = vset @ self.resid_ldr  # Z'(I-M)\Xi, (m, r)
-        cov_mat = (
-            inner_vset - vset_covar @ self.inner_covar_inv @ vset_covar.T
-        )  # Z'(I-M)Z, (m, m)
-
-        self.half_ldr_score = half_ldr_score  # (m, r)
-        self.half_score = np.dot(self.half_ldr_score, self.bases.T)  # Z'(I-M)Y, (m, N)
-        self.cov_mat = cov_mat
-        self.weights = self._get_weights(annotation_pred, annot_transform)
-        self.n_variants = self.half_ldr_score.shape[0]
-
-    def _get_weights(self, annot=None, annot_transform=True):
-        """
-        Vertically stacking weights, i.e., each row is a (m, ) vector
-
-        Parameters:
-        ------------
-        annot: (m, q) array, m is #variants, q is #functional weights
-        annot_transform: if transforming FAVOR annotations to rank
-
-        Returns:
-        ---------
-        weights_dict: a dict of weights
-
-        """
-        w1 = beta.pdf(self.maf, 1, 25).reshape(1, -1)
-        w2 = beta.pdf(self.maf, 1, 1).reshape(1, -1)
-        w3 = beta.pdf(self.maf, 0.5, 0.5).reshape(1, -1)
-        weights_dict = dict()
-
-        if annot is None:
-            weights_dict["skat(1,25)"] = w1
-            weights_dict["skat(1,1)"] = w2
-            weights_dict["burden(1,25)"] = w1
-            weights_dict["burden(1,1)"] = w2
-            weights_dict["acatv(1,25)"] = (w1 / w3) ** 2
-            weights_dict["acatv(1,1)"] = (w2 / w3) ** 2
-        else:
-            if (annot <= 0).any():
-                raise ValueError('annotation weights must be greater than 0')
-            if annot_transform:
-                annot = 1 - 10 ** (-annot / 10)
-            annot = annot.T
-            weights_dict["skat(1,25)"] = self._combine_weights(w1, np.sqrt(annot))
-            weights_dict["skat(1,1)"] = self._combine_weights(w2, np.sqrt(annot))
-            weights_dict["burden(1,25)"] = self._combine_weights(w1, annot)
-            weights_dict["burden(1,1)"] = self._combine_weights(w2, annot)
-            weights_dict["acatv(1,25)"] = self._combine_weights(
-                (w1 / w3) ** 2, annot
-            )
-            weights_dict["acatv(1,1)"] = self._combine_weights(
-                (w2 / w3) ** 2, annot
-            )
-
-        return weights_dict
-
-    def _combine_weights(self, w, w_annot):
-        """
-        Combining MAF weights with annotation weights
-
-        Parameters:
-        ------------
-        w: (m, ) array of MAF weights
-        w_annot (q, m) array of annotation weights
-
-        Returns:
-        ---------
-        weights: a dict of weights
-
-        """
-        w_annot = w_annot * w
-        weights = np.vstack([w, w_annot])
-        return weights
-
-    def _skat_test(self, weights):
-        """
-        Computing SKAT pvalues for one weight and all voxels. (tested)
-
-        For a single trait Y, the score test statistic of SKAT:
-        Y'(I-M)ZWWZ'(I-M)Y/\sigma^2.
-        W is a m by m diagonal matrix, Z is a n by m matrix,
-        M = X(X'X)^{-1}X'.
-        Under the null, it follows a mixture of chisq(1) distribution,
-        where the weights are eigenvalues of WZ'(I-M)ZW.
-        All voxels share the same eigenvalues.
-        Use Saddle-point approximation to compute pvalues.
-
-        Parameters:
-        ------------
-        weights: (m, ) array
-
-        Returns:
-        ---------
-        pvalues: (N, ) array
-
-        """
-        weighted_half_ldr_score = weights.reshape(-1, 1) * self.half_ldr_score  # (m, r)
-        ldr_score = np.dot(weighted_half_ldr_score.T, weighted_half_ldr_score)  # (r, r)
-        score_stat = (
-            np.sum(np.dot(self.bases, ldr_score) * self.bases, axis=1) / self.var
-        )  # (N, )
-
-        wcov_mat = weights.reshape(-1, 1) * self.cov_mat * weights  # (m, m)
-        egvalues, _ = np.linalg.eigh(
-            wcov_mat
-        )  # (m, ) all voxels share the same eigenvalues
-
-        egvalues = np.flip(egvalues)
-        egvalues[egvalues < 10**-8] = 0
-
-        pvalues = saddle(score_stat, egvalues, wcov_mat)
-        return pvalues
-
-    def _burden_test(self, weights):
-        """
-        Computing Burden pvalues for one weight and all voxels. (tested)
-
-        For a single trait Y, the burden test statistic
-        (w'Z'(I-M)Y)^2 / (\hat{\sigma}^2 w'Z'(I-M)Zw)
-        where w is a m by 1 vector, Z is a n by m matrix,
-        M = X(X'X)^{-1}X'.
-        Under the null, it follows a chisq(1) distribution.
-
-        Parameters:
-        ------------
-        weights: (m, ) array
-
-        Returns:
-        ---------
-        pvalues: (N, ) array
-
-        """
-        burden_score_num = np.dot(weights, self.half_score) ** 2  # (N, )
-        burden_score_denom = self.var * np.dot(np.dot(weights, self.cov_mat), weights)
-        burden_score = burden_score_num / burden_score_denom  # (N, )
-        pvalues = chi2.sf(burden_score, 1)
-        return pvalues
-
-    def _acatv_test(self, weights_A, weights_B):
-        """
-        Computing ACATV pvalues for one weight and all voxels. (tested)
-
-        First split the variant set to very rare (MAC <= mac_thresh) and common sets.
-        For very rare sets, do Burden test; for common set, do individual test,
-        then combine the pvalues by cauchy combination.
-        Individual score test:
-        numerator: Y'(I-M)ZZ'(I-M)Y
-        denominator: Y'(I-M)Y * [Z'(I-M)Z]/(n-p)
-
-        Parameters:
-        ------------
-        weights_A: (m, ) array, ACAT weights
-        weights_B: (m, ) array, Burden weights
-
-        Returns:
-        ---------
-        pvalues: (N, ) array
-
-        """
-        ## score test for individual common variants
-        if (~self.is_rare).any():
-            denom = np.diag(self.cov_mat[~self.is_rare][:, ~self.is_rare]).reshape(
-                -1, 1
-            ) * self.var.reshape(
-                1, -1
-            )  # (m, N)
-            common_variant_pv = chi2.sf(
-                (self.half_score[~self.is_rare] ** 2 / denom), 1
-            )  # (m1, N)
-            common_weights = weights_A[~self.is_rare]  # (m1, )
-        else:
-            common_variant_pv = None
-            common_weights = None
-
-        ## Burden test for rare variants
-        if (self.is_rare).any():
-            rare_burden_score_num = (
-                np.dot(weights_B[self.is_rare], self.half_score[self.is_rare]) ** 2
-            )  # (N, )
-            rare_burden_score_denom = self.var * np.dot(
-                np.dot(
-                    weights_B[self.is_rare], self.cov_mat[self.is_rare][:, self.is_rare]
-                ),
-                weights_B[self.is_rare],
-            )  # (N, )
-            rare_burden_score = rare_burden_score_num / rare_burden_score_denom
-            rare_burden_pv = chi2.sf(rare_burden_score, 1).reshape(1, -1)  # (1, N)
-            rare_weights = np.atleast_1d(np.mean(weights_A[self.is_rare]))  # (1, )
-        else:
-            rare_burden_pv = None
-            rare_weights = None
-
-        if common_variant_pv is not None and rare_burden_pv is not None:
-            pvalues = cauchy_combination(
-                np.vstack([common_variant_pv, rare_burden_pv]),
-                np.concatenate([common_weights, rare_weights]),
-            )
-        elif common_variant_pv is not None:
-            pvalues = cauchy_combination(common_variant_pv, common_weights)
-        else:
-            pvalues = rare_burden_pv
-
-        return pvalues
-
-    def do_inference(self, annot_name=None):
-        """
-        Doing inference for the variant set using multiple weights and methods.
-        Using cauchy combination to get final pvalues.
-
-        Parameters:
-        ------------
-        annot_name: a list of functional annotation names
-
-        Returns:
-        ---------
-        results: a dict of results, each value is a np.array of pvalues (q+1, N)
-
-        """
-        n_weights = self.weights["skat(1,25)"].shape[0]
-        skat_1_25_pvalues = np.zeros((n_weights, self.N))
-        skat_1_1_pvalues = np.zeros((n_weights, self.N))
-        burden_1_25_pvalues = np.zeros((n_weights, self.N))
-        burden_1_1_pvalues = np.zeros((n_weights, self.N))
-        acatv_1_25_pvalues = np.zeros((n_weights, self.N))
-        acatv_1_1_pvalues = np.zeros((n_weights, self.N))
-
-        for i in range(n_weights):
-            skat_1_25_pvalues[i] = self._skat_test(self.weights["skat(1,25)"][i])
-            skat_1_1_pvalues[i] = self._skat_test(self.weights["skat(1,1)"][i])
-            burden_1_25_pvalues[i] = self._burden_test(self.weights["burden(1,25)"][i])
-            burden_1_1_pvalues[i] = self._burden_test(self.weights["burden(1,1)"][i])
-            acatv_1_25_pvalues[i] = self._acatv_test(
-                self.weights["acatv(1,25)"][i], self.weights["burden(1,25)"][i]
-            )
-            acatv_1_1_pvalues[i] = self._acatv_test(
-                self.weights["acatv(1,1)"][i], self.weights["burden(1,1)"][i]
-            )
-
-        all_pvalues = np.vstack(
-            [
-                skat_1_25_pvalues,
-                skat_1_1_pvalues,
-                burden_1_25_pvalues,
-                burden_1_1_pvalues,
-                acatv_1_25_pvalues,
-                acatv_1_1_pvalues,
-            ]
-        )
-        results_STAAR_O = pd.DataFrame(
-            cauchy_combination(all_pvalues), columns=["STAAR-O"]
-        )
-        results_ACAT_O = cauchy_combination(
-            np.vstack(
-                [
-                    skat_1_25_pvalues[0],
-                    skat_1_1_pvalues[0],
-                    burden_1_25_pvalues[0],
-                    burden_1_1_pvalues[0],
-                    acatv_1_25_pvalues[0],
-                    acatv_1_1_pvalues[0],
-                ]
-            )
-        )
-        results_ACAT_O = pd.DataFrame(results_ACAT_O, columns=["ACAT-O"])
-        all_results = [results_STAAR_O, results_ACAT_O]
-
-        for pvalues, test_method in (
-            (skat_1_25_pvalues, "SKAT(1,25)"),
-            (skat_1_1_pvalues, "SKAT(1,1)"),
-            (burden_1_25_pvalues, "Burden(1,25)"),
-            (burden_1_1_pvalues, "Burden(1,1)"),
-            (acatv_1_25_pvalues, "ACAT-V(1,25)"),
-            (acatv_1_1_pvalues, "ACAT-V(1,1)"),
+    def __init__(
+            self, 
+            null_model, 
+            sparse_genotype_dict, 
+            chr_gene_numeric_idxs, 
+            maf_dict, 
+            mac_dict, 
+            perm,
+            sig_thresh,
+            resid_ldr_dict
         ):
-            if n_weights > 1:
-                comb_pvalues = cauchy_combination(pvalues).reshape(-1, 1)
-            else:
-                comb_pvalues = None
-            all_pvalues = format_results(
-                pvalues.T, comb_pvalues, test_method, annot_name
-            )
-            all_results.append(all_pvalues)
-        all_results_df = pd.concat(all_results, axis=1)
+        """
+        Parameters:
+        ------------
+        null_model: a NullModel instance
+        sparse_genotype_dict: a dict of sparse genotype per chr
+        chr_gene_numeric_idxs: a dict of gene idxs per chr per bin
+        maf_dict: a dict of maf per chr
+        mac_dict: a dict of mac per chr
+        perm: an instance of PermDistribution
+        sig_thresh: significant threshold
+        resid_ldr_dict: a dict resid_ldr per chr
 
-        return all_results_df
+        """
+        self.bases = null_model.bases.astype(np.float32)
+        self.sparse_genotype_dict = sparse_genotype_dict # chr
+        self.chr_gene_numeric_idxs = chr_gene_numeric_idxs # chr-bin
+        self.maf_dict = maf_dict # chr
+        self.mac_dict = mac_dict # chr
+        self.perm = perm
+        self.all_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
+                         (10,11), (12,14), (15,20), (21,30), (31,60), 
+                         (61,100), (101,500), (501,1000)]
+        self.sig_thresh = sig_thresh
+        self.resid_ldr_dict = resid_ldr_dict
+        self.n_subs, self.n_covars = null_model.covar.shape
+        self.logger = logging.getLogger(__name__)
 
+        self.vset_ld_dict = self._get_ld_matrix() # chr
+        self.vset_half_covar_proj_dict = self._get_vset_half_covar_proj(null_model.covar) # chr
+        self.var_dict = self._get_var() # chr
+        self.chr_cov_mat_dict = self._get_cov_mat() # chr-bin
+        self.vset_set_dict = self._get_vset_set() # chr
+        self.half_ldr_score_dict = self._compute_sumstats() # chr
 
-def cauchy_combination(pvalues, weights=None, axis=0):
+    def _get_ld_matrix(self):
+        vset_ld_dict = dict()
+        for chr, vset in self.sparse_genotype_dict.items():
+            vset = vset.astype(np.uint16)
+            vset_ld = vset @ vset.T
+            vset_ld_dict[chr] = vset_ld
+        return vset_ld_dict
+
+    def _get_vset_half_covar_proj(self, covar):
+        covar_U, _, covar_Vt = np.linalg.svd(covar, full_matrices=False)
+        half_covar_proj = np.dot(covar_U, covar_Vt).astype(np.float32)
+        vset_half_covar_proj_dict = dict()
+        for chr, vset in self.sparse_genotype_dict.items():
+            vset_half_covar_proj = vset @ half_covar_proj
+            vset_half_covar_proj_dict[chr] = vset_half_covar_proj
+        return vset_half_covar_proj_dict
+
+    def _get_var(self):
+        var_dict = dict()
+        for chr, resid_ldr in self.resid_ldr_dict.items():
+            inner_ldr = np.dot(resid_ldr.T, resid_ldr).astype(np.float32)
+            var = np.sum(np.dot(self.bases, inner_ldr) * self.bases, axis=1)
+            var /= self.n_subs - self.n_covars # (N, )
+            var_dict[chr] = var
+        return var_dict
+
+    def _get_cov_mat(self):
+        """
+        Compute Z'(I-M)Z for all variant sets
+        
+        """
+        chr_cov_mat_dict = dict()
+        for chr, gene_numeric_idxs in self.chr_gene_numeric_idxs.items():
+            cov_mat_dict = dict()
+            for bin, gene_numeric_idx in gene_numeric_idxs.items():
+                cov_mat_list = list()
+                for numeric_idx in gene_numeric_idx:
+                    vset_half_covar_proj = self.vset_half_covar_proj_dict[chr][numeric_idx]
+                    vset_ld = self.vset_ld_dict[chr][numeric_idx][:, numeric_idx]
+                    cov_mat = np.array((vset_ld - vset_half_covar_proj @ vset_half_covar_proj.T))
+                    cov_mat_list.append(cov_mat)
+                cov_mat_dict[bin] = cov_mat_list
+            chr_cov_mat_dict[chr] = cov_mat_dict
+        return chr_cov_mat_dict
+
+    def _get_vset_set(self):
+        vset_set_dict = dict()
+        for chr, var in self.var_dict.items():
+            vset_set = VariantSetTest(self.bases, var, self.perm)
+            vset_set_dict[chr] = vset_set
+        return vset_set_dict
+
+    def _compute_sumstats(self):
+        half_ldr_score_dict = dict()
+        for chr, resid_ldr in self.resid_ldr_dict.items():
+            half_ldr_score = self.sparse_genotype_dict[chr] @ resid_ldr
+            half_ldr_score_dict[chr] = half_ldr_score
+        return half_ldr_score_dict
+
+    def _variant_set_test(self):
+        """
+        A wrapper function of variant set test for multiple sets
+        
+        """
+        chr_sig_count_dict = dict()
+        for chr, gene_numeric_idxs in self.chr_gene_numeric_idxs.items():
+            sig_count_dict = dict()
+            for bin, gene_numeric_idx in gene_numeric_idxs.items(): 
+                sig_count_list = list()
+                for gene_id, numeric_idx in enumerate(gene_numeric_idx):
+                    half_ldr_score = self.half_ldr_score_dict[chr][numeric_idx]
+                    cov_mat = self.chr_cov_mat_dict[chr][bin][gene_id]
+                    maf = self.maf_dict[chr][numeric_idx]
+                    cmac = int(np.sum(self.mac_dict[chr][numeric_idx]))
+                    vset_test = self.vset_set_dict[chr]
+                    sig_count = self._variant_set_test_(
+                        half_ldr_score, cov_mat, maf, cmac, vset_test
+                    )
+                    sig_count_list.append(sig_count)
+                sig_count_dict[bin] = sig_count_list
+            chr_sig_count_dict[chr] = sig_count_dict
+
+        return chr_sig_count_dict
+
+    def _variant_set_test_(self, half_ldr_score, cov_mat, maf, cmac, vset_test):
+        """
+        Testing a single variant set
+        
+        """
+        vset_test.input_vset(half_ldr_score, cov_mat, maf, cmac, None, None)
+        pvalues, _ = vset_test.do_inference_tests(['staar'], None, False)
+        pvalues = pvalues.iloc[:, 0]
+        sig_count = np.nansum(pvalues < self.sig_thresh)
+
+        return sig_count
+    
+    def run(self):
+        """
+        The main function for doing simulation
+
+        """
+        chr_sig_count_dict = self._variant_set_test()
+        bin_sig_count_dict = {cmac_bin: list() for cmac_bin in self.all_bins}
+        for _, sig_count_dict in chr_sig_count_dict.items():
+            for cmac_bin, sig_count_list in sig_count_dict.items():
+                bin_sig_count_dict[cmac_bin].extend(sig_count_list)
+
+        for cmac_bin, sig_count_list in bin_sig_count_dict.items():
+            bin_sig_count_dict[cmac_bin] = np.mean(sig_count_list)
+
+        return pd.DataFrame(bin_sig_count_dict)
+    
+
+def creating_mask_null(mac_dict, cmac_bins_count=50000):
     """
-    Cauchy combination for an array of pvalues and weights.
+    Creating masks for type I error evaluation
 
     Parameters:
     ------------
-    pvalues: (m1, N) array
-    weights: (m1, ) array
-    axis: which axis to take average
+    mac_dict: a dict of mac per chr
+    cmac_bins_count: #genes per cmac bin
 
     Returns:
     ---------
-    cct_pvalues: (N, ) array
-
-    """
-    n_weights, n_voxels = pvalues.shape
-
-    if weights is None:
-        weights = np.ones(n_weights)
-    elif (weights <= 0).any():
-        raise ValueError("weights must be positive")
-    elif n_weights != weights.shape[0]:
-        raise ValueError(
-            "the length of weights should be the same as that of the p-values"
-        )
-    elif np.isnan(weights).any():
-        return np.full(n_voxels, np.nan)
-
-    output0_voxels = (pvalues == 0).any(axis=0)
-    output1_voxels = (pvalues == 1).any(axis=0)
-
-    nan_voxels = reduce(np.logical_and, [output0_voxels, output1_voxels])
-    nan_voxels = reduce(np.logical_or, [nan_voxels, np.isnan(pvalues).any(axis=0)])
-
-    good_voxels = ~reduce(np.logical_or, [nan_voxels, output0_voxels, output1_voxels])
-    pvalues = pvalues[:, good_voxels]
-
-    normed_weights = weights / np.sum(weights)
-    normed_weights = np.tile(normed_weights, (pvalues.shape[1], 1)).T
-
-    is_small = pvalues < 10**-16
-    if not is_small.any():
-        stats = np.sum(np.tan((0.5 - pvalues) * np.pi) * normed_weights, axis=axis)
-    else:
-        stats1 = np.sum(
-            np.where(~is_small, np.tan((0.5 - pvalues) * np.pi) * normed_weights, 0),
-            axis=axis,
-        )
-        stats2 = (
-            np.sum(np.where(is_small, normed_weights / pvalues, 0), axis=axis) / np.pi
-        )
-        stats = stats1 + stats2
-
-    cct_pvalues = np.zeros(stats.shape)
-    is_large = stats > 10**15
-    cct_pvalues[~is_large] = cauchy.sf(stats[~is_large], loc=0, scale=1)
-    cct_pvalues[is_large] = 1 / stats[is_large] / np.pi
-
-    output = np.zeros(n_voxels)
-    output[good_voxels] = cct_pvalues
-    output[nan_voxels] = np.nan
-    output[output0_voxels] = 0
-    output[output1_voxels] = 1
-
-    return output
-
-
-def prepare_vset_test(vset):
-    """
-    Extracting data from MatrixTable
-
-    Parameters:
-    ------------
-    snps_mt_cate: MatrixTable of a variant category
-
-    Returns:
-    ---------
-    vset: (n, m) BlockMatrix
-    maf: (m, ) np.array of MAF
-    is_rare: (m, ) np.array boolean index indicating MAC < mac_threshold
-
-    """
-    maf = np.mean(vset, axis=0) / 2
-    is_rare = np.sum(vset, axis=0) <= 100
-    vset = vset
-    return maf, is_rare, vset
-
-
-def format_results(indiv_pvalues, comb_pvalues, method_name, indiv_annot_name=None):
-    """
-    Formating test results. Individual p-values go first followed by combined p-values.
-
-    Parameters:
-    ------------
-    indiv_pvalues: (N, 1) array
-    comb_pvalues: (N, ) array
-    indiv_annot_name: name of each functional annotation
-    method_name: test method with beta distribution parameters, such as SKAT(1,25)
-
-    Returns:
-    ---------
-    cct_pvalues: (N, ) array
-
-    """
-    if comb_pvalues is not None:
-        col_names = [method_name]
-        if indiv_annot_name is not None:
-            for annot in indiv_annot_name:
-                col_names.append(f"{method_name}-{annot}")
-        col_names.append(f"STAAR-{method_name}")
-        res = pd.DataFrame(
-            np.column_stack([indiv_pvalues, comb_pvalues]), columns=col_names
-        )
-    else:
-        res = pd.DataFrame(indiv_pvalues, columns=[method_name])
-
-    return res
-
-
-
-def single_gene_analysis(
-    vset, vset_test, annot_phred, log
-):
-    """
-    Single gene analysis
-
-    Parameters:
-    ------------
-    vset
-    vset_test: an instance of VariantSetTest
-    annot_phred
-    log: a logger
-
-    Returns:
-    ---------
-    cate_pvalues: a dict (keys: category, values: p-value)
-
-    """
-    # individual analysis
-    cate_pvalues = dict()
-    maf, is_rare, vset = prepare_vset_test(vset)
-    phred_cate = np.log10(np.abs(1 - annot_phred)) * -10 # to accommodate staar.py
-    phred_cate[np.isinf(phred_cate)] = 0.001
-    vset_test.input_vset(vset, maf, is_rare, phred_cate)
-    # log.info(
-    #     f"Doing analysis for {annot_names} ({vset_test.n_variants} variants) ..."
-    # )
-    pvalues = vset_test.do_inference(annot_names)
-    cate_pvalues['annotation'] = {
-        "n_variants": vset_test.n_variants,
-        "pvalues": pvalues,
-    }
-
-    return cate_pvalues
-
-
-def format_output(cate_pvalues, chr, n_variants, voxels, region):
-    """
-    organizing pvalues to a structured format
-
-    Parameters:
-    ------------
-    cate_pvalues: a pd.DataFrame of pvalues of the variant category
-    chr: chromosome
-    n_variants: #variants of the category
-    voxels: zero-based voxel idxs of the image
-
-    Returns:
-    ---------
-    output: a pd.DataFrame of pvalues with metadata
-
-    """
-    meta_data = pd.DataFrame(
-        {
-            "INDEX": voxels + 1,
-            "REGION": region,
-            "CHR": chr,
-            "N_VARIANT": n_variants,
-        }
-    )
-    output = pd.concat([meta_data, cate_pvalues], axis=1)
-    return output
-
-
-def format_output2(pvalues):
-    """
-    Getting the number of significant samples under different thresholds
+    chr_gene_numeric_idxs: a dict of dict of gene idxs
     
     """
-    all_results = dict()
-    thresh_list = [0.05, 0.005, 0.0005, 0.00005, 0.000005] # 0.05 to 5*10**-6
-    thresh_str = {0.05:'5e2', 0.005:'5e3', 0.0005:'5e4', 0.00005:'5e5', 0.000005:'5e6'}
+    chr_gene_numeric_idxs = dict()
+    cmac_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
+                 (10,11), (12,14), (15,20), (21,30), (31,60), 
+                 (61,100), (101,500), (501,1000)]
+    n_variants_list = np.array([len(mac_dict[chr]) for chr in range(1, 23)])
+    n_genes_chr_list = (n_variants_list / np.sum(n_variants_list) * cmac_bins_count).astype(int)
 
-    for col in pvalues.columns:
-        for thresh in thresh_list:
-            method = col + '-' + thresh_str[thresh]
-            all_results[method] = np.sum(pvalues[col] < thresh)
-            
-    return pd.DataFrame.from_dict(all_results, orient='index')
+    for chr in range(1, 23):
+        mac = mac_dict[chr]
+        n_variants = n_variants_list[chr-1]
+        n_genes = n_genes_chr_list[chr-1]
+        variant_idxs = np.arange(n_variants)
+        gene_numeric_idxs = dict() 
+        for bin in cmac_bins:
+            output = list()
+            window_range = (max(2, int(bin[0]*0.1)), bin[1] + 1)
+            while True:
+                permuted_variant_idxs = variant_idxs[np.random.permutation(n_variants)]
+                start = 0
+                window_size = np.random.choice(list(range(*window_range)), 1)[0]
+                skip_size = int(window_size * 0.8) + 1
+                while start + window_size < n_variants:
+                    end = start + window_size
+                    selected_variants = permuted_variant_idxs[start: end]
+                    cmac = np.sum(mac[selected_variants]) 
+                    if bin[0] <= cmac <= bin[1]:
+                        output.append(selected_variants)
+                        if len(output) >= n_genes:
+                            break
+                    start += skip_size
+                if len(output) >= n_genes:
+                    break
+            gene_numeric_idxs[bin] = output
+        chr_gene_numeric_idxs[chr] = gene_numeric_idxs
+
+    return chr_gene_numeric_idxs
 
 
-def list_datasets(hdf5_file):
-    dataset_names = []
+def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=10000):
+    """
+    Creating masks for power evaluation
+
+    Parameters:
+    ------------
+    mac_dict: a dict of mac per chr
+    causal_idx_dict: a dict of causal idxs per chr
+    cmac_bins_count: #genes per cmac bin
+
+    Returns:
+    ---------
+    gene_numeric_idxs: a list of list of variant idxs for each gene
     
-    def visitor_func(name, node):
-        if isinstance(node, h5py.Dataset):
-            dataset_names.append(name)
-    
-    hdf5_file.visititems(visitor_func)
-    return dataset_names
+    """
+    chr_gene_numeric_idxs = dict()
+    cmac_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
+                 (10,11), (12,14), (15,20), (21,30), (31,60), 
+                 (61,100), (101,500), (501,1000)]
+    n_variants_list = np.array([len(mac_dict[chr]) for chr in range(1, 23)])
+    n_genes_chr_list = (n_variants_list / np.sum(n_variants_list) * cmac_bins_count).astype(int)
+
+    for chr in range(1, 23):
+        mac = mac_dict[chr]
+        causal_idxs = causal_idx_dict[chr]
+        n_variants = n_variants_list[chr-1]
+        n_genes = n_genes_chr_list[chr-1]
+        variant_idxs = np.arange(n_variants)
+        gene_numeric_idxs = dict() 
+        for bin in cmac_bins:
+            output = list()
+            window_range = (max(2, int(bin[0]*0.1)), bin[1] + 1)
+            while True:
+                n_causal_variants = np.random.choice(list(range(window_range[0], bin[1])), 1)[0]
+                permuted_variant_idxs = variant_idxs[np.random.permutation(n_variants)]
+                start = 0
+                window_size = np.random.choice(list(range(n_causal_variants, bin[1] + 1)), 1)[0]
+                skip_size = int(window_size * 0.8) + 1
+                while start + window_size < n_variants:
+                    while True:
+                        selected_causal_variants = np.random.choice(causal_idxs, n_causal_variants)
+                        if np.sum(mac[selected_causal_variants]) < bin[1]:
+                            break
+                    end = start + window_size
+                    selected_variants = permuted_variant_idxs[start: end]
+                    selected_variants = np.concatenate([selected_variants, selected_causal_variants])
+                    cmac = np.sum(mac[selected_variants]) 
+                    if bin[0] <= cmac <= bin[1]:
+                        output.append(selected_variants)
+                        if len(output) >= n_genes:
+                            break
+                    start += skip_size
+                if len(output) >= n_genes:
+                    break
+            gene_numeric_idxs[bin] = output
+        chr_gene_numeric_idxs[chr] = gene_numeric_idxs
+
+    return chr_gene_numeric_idxs
+
+
+def check_input(args):
+    if args.sparse_genotype is None:
+        raise ValueError("--sparse-genotype is required")
+    if args.null_model is None:
+        raise ValueError("--null-model is required")
+    if args.perm is None:
+        raise ValueError("--perm is required")
+    args.sparse_genotype = ds.parse_input(args.sparse_genotype)
+    if args.causal_idx is not None:
+        args.causal_idx = ds.parse_input(args.causal_idx)
 
 
 def run(args, log):
-    # reading data and selecting voxels and LDRs
-    log.info(f"Read null model from {args.null_model}")
-    null_model = NullModel(args.null_model)
-    null_model.select_ldrs(args.n_ldrs)
-
-    # read loco preds
+    check_input(args, log)
     try:
+        # reading data and selecting LDRs
+        log.info(f"Read null model from {args.null_model}")
+        null_model = NullModel(args.null_model)
+        null_model.select_ldrs(args.n_ldrs)
+
+        # reading sparse genotype data
+        sparse_genotype_dict = dict()
+        mac_dict = dict()
+        maf_dict = dict()
+        rex_chr = re.compile("chr(\d+)")
+        n_variants = 0
+        for sparse_genotype in args.sparse_genotype:
+            chr = int(rex_chr.findall(sparse_genotype)[0])
+            sparse_genotype = load_npz(sparse_genotype)
+            mac = np.squeeze(np.array(sparse_genotype.sum(axis=1)))
+            maf = mac / sparse_genotype.shape[1] / 2
+            n_variants += sparse_genotype.shape[0]
+            sparse_genotype_dict[chr] = sparse_genotype
+            mac_dict[chr] = mac
+            maf_dict[chr] = maf
+        n_subs = sparse_genotype_dict[chr].shape[1]
+
+        log.info(f"Read sparse genotype data from {args.sparse_genotype}")
+        log.info(f"{n_subs} subjects and {n_variants} variants.")
+
+        if args.causal_idx is not None:
+            causal_idx_dict = dict()
+            for causal_idx in args.causal_idx:
+                chr = int(rex_chr.findall(causal_idx)[0])
+                causal_idx_dict[chr] = np.loadtxt(causal_idx)
+        else:
+            causal_idx_dict = None
+
+        # reading loco preds
         if args.loco_preds is not None:
             log.info(f"Read LOCO predictions from {args.loco_preds}")
             loco_preds = LOCOpreds(args.loco_preds)
-            loco_preds.select_ldrs((0, args.n_ldrs))
-            if loco_preds.ldr_col[1] != null_model.n_ldrs:
+            if args.n_ldrs is not None:
+                loco_preds.select_ldrs((0, args.n_ldrs))
+            if loco_preds.ldr_col[1] - loco_preds.ldr_col[0] != null_model.n_ldrs:
                 raise ValueError(
                     (
                         "inconsistent dimension in LDRs and LDR LOCO predictions. "
                         "Try to use --n-ldrs"
                     )
                 )
-            common_ids = ds.get_common_idxs(
-                null_model.ids,
-                loco_preds.ids,
-                None,
-                single_id=True,
-            )
         else:
-            common_ids = ds.get_common_idxs(null_model.ids, None, single_id=True)
             loco_preds = None
-        log.info(f"{len(common_ids)} common subjects in the data.")
+
         log.info(
-            (f"{null_model.covar.shape[1]} fixed effects in the covariates (including the intercept) "
-            "after removing redundant effects.\n")
+            (
+                f"{null_model.covar.shape[1]} fixed effects in the covariates "
+                "(including the intercept) after removing redundant effects.\n"
+            )
+        )
+        
+        # reading permutation
+        log.info(f"Read permutation from {args.perm}")
+        perm = PermDistribution(args.perm)
+
+        # split genotype into regions
+        if causal_idx_dict is None:
+            chr_gene_numeric_idxs = creating_mask_null(mac_dict)
+        else:
+            chr_gene_numeric_idxs = creating_mask_null(mac_dict, causal_idx_dict)
+
+        # adjust for sample relatedness
+        resid_ldr_dict = dict()
+        for chr in range(1, 23):
+            resid_ldr_dict[chr] = null_model.resid_ldr - loco_preds.data_reader(chr)
+
+        # permutation
+        rv_simulation = RVsimulation(
+            null_model, 
+            sparse_genotype_dict, 
+            chr_gene_numeric_idxs, 
+            maf_dict, 
+            mac_dict, 
+            perm,
+            2.5e-6,
+            resid_ldr_dict
         )
 
-        # read genotype data
-        rex1 = re.compile("chr(\d+)")
-        rex2 = re.compile("region(\d+)")
-        chr = int(rex1.findall(args.regions)[0])
-        region_file = h5py.File(args.regions, 'r')
-        annot_file = h5py.File(args.annot, 'r')
-        vset_arrays = list_datasets(region_file)
+        bin_sig_count = rv_simulation.run()
 
-        vset_test = VariantSetTest(
-            null_model.bases, null_model.resid_ldr, null_model.covar, chr, loco_preds
-        )
+        out_path = f"{args.out}.txt"
+        bin_sig_count.to_csv(out_path, sep='\t', index=None)
+        log.info(f"\nSave results to {args.out}.txt")
 
-        n_subregions = 0
-        for vset_array in tqdm(vset_arrays):
-            vset = region_file[vset_array][:]
-
-            if args.shuf:
-                np.random.shuffle(vset)
-
-            annot = annot_file[vset_array + '_annot'][:]
-            # region = int(rex2.findall(vset_array)[0])
-
-            if args.causal == 'causal':
-                region_size = vset.shape[1]
-            else:
-                region_size = 5
-
-            for start in range(0, vset.shape[1], region_size):
-                vset_ = vset[:, start:start+region_size]
-                annot_ = annot[start:start+region_size]
-                n_subregions += 1
-            
-                # single gene analysis
-                cate_pvalues = single_gene_analysis(
-                    vset_,
-                    vset_test,
-                    annot_,
-                    log,
-                )
-                
-                results_ = format_output2(cate_pvalues['annotation']['pvalues'])
-                if 'results' not in locals():
-                    results = results_
-                else:
-                    results += results_
-
-        out_path = f"{args.out}/chr{chr}_{n_subregions}regions.txt"
-        results.to_csv(out_path, sep='\t', header=None)
-        log.info(f"\nSave results for chr{chr} to {out_path}")
-
-            # format output
-            # for _, cate_results in cate_pvalues.items():
-            #     cate_output = format_output(
-            #         cate_results["pvalues"],
-            #         chr,
-            #         cate_results["n_variants"],
-            #         null_model.voxel_idxs,
-            #         region,
-            #     )
-            #     out_path = f"{args.out}/chr{chr}_region{region}_size{vset.shape[1]}.txt"
-            #     cate_output.to_csv(
-            #         out_path,
-            #         sep="\t",
-            #         header=True,
-            #         na_rep="NA",
-            #         index=None,
-            #         float_format="%.5e",
-            #     )
-            #     log.info(f"\nSave results for chr{chr} region{region} to {out_path}")
     finally:
-        if args.loco_preds is not None:
+        if args.loco_preds is not None and loco_preds in locals():
             loco_preds.close()
-        if 'region_file' in locals():
-            region_file.close()
-        if 'annot_file' in locals():
-            annot_file.close()
-
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--regions')
-parser.add_argument('--annot')
 parser.add_argument('--null-model')
+parser.add_argument('--sparse-genotype')
 parser.add_argument('--loco-preds')
 parser.add_argument('--out')
 parser.add_argument('--n-ldrs', type=int)
-parser.add_argument('--shuf', action='store_true')
-parser.add_argument('--causal')
+parser.add_argument('--causal-idx')
+parser.add_argument('--perm')
 
 
 if __name__ == '__main__':
@@ -694,7 +437,7 @@ if __name__ == '__main__':
         defaults = vars(parser.parse_args(""))
         opts = vars(args)
         non_defaults = [x for x in opts.keys() if opts[x] != defaults[x]]
-        header = "wgs_simulation.py \\\n"
+        header = "run_simulation.py \\\n"
         options = [
             "--" + x.replace("_", "-") + " " + str(opts[x]) + " \\"
             for x in non_defaults
@@ -702,8 +445,6 @@ if __name__ == '__main__':
         header += "\n".join(options).replace(" True", "").replace(" False", "")
         header = header + "\n"
         log.info(header)
-        if args.shuf:
-            log.info('shuffle genotype data')
         run(args, log)
     except Exception:
         log.info(traceback.format_exc())
