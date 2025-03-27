@@ -4,6 +4,7 @@ import time
 import argparse
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from scipy.sparse import load_npz
 
 from utils.relatedness import LOCOpreds
@@ -26,12 +27,24 @@ power:
 """
 
 
+def log_execution_time(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed_time = time.perf_counter() - start_time
+        log.info(f"{func.__name__} executed in {elapsed_time:.4f}s")
+        return result
+    return wrapper
+
+
 class RVsimulation:
     """
     Doing simulation for RVRVA
 
     """
 
+    @log_execution_time
     def __init__(
             self, 
             covar, 
@@ -118,7 +131,7 @@ class RVsimulation:
     def _get_vset_set(self):
         vset_set_dict = dict()
         for chr, var in self.var_dict.items():
-            vset_set = VariantSetTest(self.bases, var, self.perm, np.arange(100))
+            vset_set = VariantSetTest(self.bases, var, self.perm, np.arange(self.n_voxels))
             vset_set_dict[chr] = vset_set
         return vset_set_dict
 
@@ -129,8 +142,10 @@ class RVsimulation:
             half_ldr_score_dict[chr] = half_ldr_score
         return half_ldr_score_dict
     
+    @log_execution_time
     def get_image_specific(self, bases, perm, resid_ldr_dict):
         self.bases = bases.astype(np.float32)
+        self.n_voxels = self.bases.shape[0]
         self.perm = perm
         self.resid_ldr_dict = resid_ldr_dict
         self.var_dict = self._get_var()
@@ -174,6 +189,7 @@ class RVsimulation:
 
         return sig_count
     
+    @log_execution_time
     def run(self, sample_id):
         """
         The main function for doing simulation
@@ -188,11 +204,12 @@ class RVsimulation:
         bin_sig_count_dict_ = dict()
         for cmac_bin, sig_count_list in bin_sig_count_dict.items():
             cmac_bin_str = "_".join([str(x) for x in cmac_bin])
-            bin_sig_count_dict_[cmac_bin_str] = np.mean(sig_count_list)
+            bin_sig_count_dict_[cmac_bin_str] = np.mean(sig_count_list) / self.n_voxels
 
         return pd.DataFrame(bin_sig_count_dict_, index=[sample_id])
-    
 
+
+@log_execution_time
 def creating_mask_null(mac_dict, cmac_bins_count=50000):
     """
     Creating masks for type I error evaluation
@@ -246,7 +263,8 @@ def creating_mask_null(mac_dict, cmac_bins_count=50000):
     return chr_gene_numeric_idxs
 
 
-def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=100):
+@log_execution_time
+def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=10000):
     """
     Creating masks for power evaluation
 
@@ -265,7 +283,7 @@ def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=100):
     cmac_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
                  (10,11), (12,14), (15,20), (21,30), (31,60), 
                  (61,100), (101,500), (501,1000)]
-    n_variants_list = np.array([len(mac) for mac in mac_dict.items()])
+    n_variants_list = np.array([len(mac) for _, mac in mac_dict.items()])
     chr_list = list(mac_dict.keys())
     n_genes_chr_list = (n_variants_list / np.sum(n_variants_list) * cmac_bins_count).astype(int)
 
@@ -274,37 +292,64 @@ def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=100):
         n_variants = n_variants_list[i]
         n_genes = n_genes_chr_list[i]
         causal_idxs = causal_idx_dict[chr]
-        variant_idxs = np.arange(n_variants)
+
+        ## remove causal variants
+        variant_idxs = np.setdiff1d(np.arange(n_variants), causal_idxs)
+        n_variants = len(variant_idxs)
+
+        ## get a dict of mac-position
+        mac_positions = defaultdict(list)
+        for mac_i, x in enumerate(mac):
+            mac_positions[x].append(mac_i)
+
         gene_numeric_idxs = dict() 
         for bin in cmac_bins:
             output = list()
-            window_range = (max(2, int(bin[0]*0.1)), bin[1] + 1)
             while True:
-                n_causal_variants = np.random.choice(list(range(window_range[0], bin[1])), 1)[0]
-                permuted_variant_idxs = variant_idxs[np.random.permutation(n_variants)]
-                start = 0
-                window_size = np.random.choice(list(range(n_causal_variants, bin[1] + 1)), 1)[0]
-                skip_size = int(window_size * 0.8) + 1
-                while start + window_size < n_variants:
-                    while True:
-                        selected_causal_variants = np.random.choice(causal_idxs, n_causal_variants)
-                        if np.sum(mac[selected_causal_variants]) < bin[1]:
-                            break
-                    end = start + window_size
-                    selected_variants = permuted_variant_idxs[start: end]
-                    selected_variants = np.concatenate([selected_variants, selected_causal_variants])
-                    cmac = np.sum(mac[selected_variants]) 
-                    if bin[0] <= cmac <= bin[1]:
-                        output.append(selected_variants)
-                        if len(output) >= n_genes:
-                            break
-                    start += skip_size
+                upper_bound = bin[0] if bin[0] < 50 else int(bin[0] * 0.5)
+                n_causal_variants = np.random.choice(list(range(1, upper_bound)), 1)[0]
+                while True:
+                    causal_variants = np.random.choice(causal_idxs, n_causal_variants)
+                    causal_variants_cmac = np.sum(mac[causal_variants])
+                    if causal_variants_cmac < bin[0]:
+                        break
+                n_added = 0
+                while n_added < 10:
+                    non_causal_variants_cmac = np.random.choice(list(range(bin[0], bin[1]+1)), 1)[0]
+                    non_causal_variants_cmac -= causal_variants_cmac
+                    assert non_causal_variants_cmac > 0
+                    non_causal_variants = select_variants_for_cmac(mac_positions, non_causal_variants_cmac)
+                    selected_variants = np.concatenate([non_causal_variants, causal_variants])
+                    assert bin[0] <= np.sum(mac[selected_variants]) <= bin[1]
+                    output.append(selected_variants)
+                    n_added += 1
+                    if len(output) >= n_genes:
+                        break
                 if len(output) >= n_genes:
                     break
             gene_numeric_idxs[bin] = output
         chr_gene_numeric_idxs[chr] = gene_numeric_idxs
 
     return chr_gene_numeric_idxs
+
+
+def select_variants_for_cmac(mac_positions, cmac):
+    """
+    Randomly select variants for the target cmac
+    
+    """
+    macs = np.array(list(mac_positions.keys()))
+    macs = macs[macs <= cmac]
+    combo = list()
+    current_cmac = 0
+    while current_cmac < cmac:
+        mac_ = np.random.choice(macs, 1)[0]
+        if current_cmac + mac_ <= cmac:
+            combo.append(mac_)
+            current_cmac += mac_
+            macs = macs[macs <= cmac - current_cmac]
+
+    return np.array([np.random.choice(mac_positions[mac], 1)[0] for mac in combo])
 
 
 def check_input(args):
@@ -354,7 +399,7 @@ def run(args, log):
             causal_idx_dict = dict()
             for chr in chr_list:
                 causal_idx_file = args.causal_idx.replace('@', str(chr))
-                causal_idx_dict[chr] = np.loadtxt(causal_idx_file)
+                causal_idx_dict[chr] = np.loadtxt(causal_idx_file).astype(int)
         else:
             causal_idx_dict = None
 
@@ -389,14 +434,14 @@ def run(args, log):
         if causal_idx_dict is None:
             chr_gene_numeric_idxs = creating_mask_null(mac_dict)
         else:
-            chr_gene_numeric_idxs = creating_mask_null(mac_dict, causal_idx_dict)
+            chr_gene_numeric_idxs = creating_mask_causal(mac_dict, causal_idx_dict)
 
         # adjust for sample relatedness
         resid_ldr_dict = dict()
         for chr in chr_list:
             resid_ldr_dict[chr] = null_model.resid_ldr - loco_preds.data_reader(chr)
 
-        # permutation
+        # simulation
         rv_simulation = RVsimulation(
             null_model.covar, 
             sparse_genotype_dict, 
