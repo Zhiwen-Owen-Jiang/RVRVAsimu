@@ -1,5 +1,4 @@
 import os
-import re
 import traceback
 import time
 import argparse
@@ -7,7 +6,6 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import load_npz
 
-import utils.dataset as ds
 from utils.relatedness import LOCOpreds
 from utils.null import NullModel
 from utils.vsettest import VariantSetTest
@@ -36,14 +34,12 @@ class RVsimulation:
 
     def __init__(
             self, 
-            null_model, 
+            covar, 
             sparse_genotype_dict, 
             chr_gene_numeric_idxs, 
             maf_dict, 
             mac_dict, 
-            perm,
             sig_thresh,
-            resid_ldr_dict
         ):
         """
         Parameters:
@@ -58,26 +54,21 @@ class RVsimulation:
         resid_ldr_dict: a dict resid_ldr per chr
 
         """
-        self.bases = null_model.bases.astype(np.float32)
+        self.covar = covar
+        self.n_subs, self.n_covars = covar.shape
         self.sparse_genotype_dict = sparse_genotype_dict # chr
         self.chr_gene_numeric_idxs = chr_gene_numeric_idxs # chr-bin
         self.maf_dict = maf_dict # chr
         self.mac_dict = mac_dict # chr
-        self.perm = perm
         self.all_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
                          (10,11), (12,14), (15,20), (21,30), (31,60), 
                          (61,100), (101,500), (501,1000)]
         self.sig_thresh = sig_thresh
-        self.resid_ldr_dict = resid_ldr_dict
-        self.n_subs, self.n_covars = null_model.covar.shape
         self.logger = logging.getLogger(__name__)
 
         self.vset_ld_dict = self._get_ld_matrix() # chr
-        self.vset_half_covar_proj_dict = self._get_vset_half_covar_proj(null_model.covar) # chr
-        self.var_dict = self._get_var() # chr
+        self.vset_half_covar_proj_dict = self._get_vset_half_covar_proj() # chr
         self.chr_cov_mat_dict = self._get_cov_mat() # chr-bin
-        self.vset_set_dict = self._get_vset_set() # chr
-        self.half_ldr_score_dict = self._compute_sumstats() # chr
 
     def _get_ld_matrix(self):
         vset_ld_dict = dict()
@@ -87,8 +78,8 @@ class RVsimulation:
             vset_ld_dict[chr] = vset_ld
         return vset_ld_dict
 
-    def _get_vset_half_covar_proj(self, covar):
-        covar_U, _, covar_Vt = np.linalg.svd(covar, full_matrices=False)
+    def _get_vset_half_covar_proj(self):
+        covar_U, _, covar_Vt = np.linalg.svd(self.covar, full_matrices=False)
         half_covar_proj = np.dot(covar_U, covar_Vt).astype(np.float32)
         vset_half_covar_proj_dict = dict()
         for chr, vset in self.sparse_genotype_dict.items():
@@ -127,7 +118,7 @@ class RVsimulation:
     def _get_vset_set(self):
         vset_set_dict = dict()
         for chr, var in self.var_dict.items():
-            vset_set = VariantSetTest(self.bases, var, self.perm)
+            vset_set = VariantSetTest(self.bases, var, self.perm, np.arange(100))
             vset_set_dict[chr] = vset_set
         return vset_set_dict
 
@@ -137,6 +128,14 @@ class RVsimulation:
             half_ldr_score = self.sparse_genotype_dict[chr] @ resid_ldr
             half_ldr_score_dict[chr] = half_ldr_score
         return half_ldr_score_dict
+    
+    def get_image_specific(self, bases, perm, resid_ldr_dict):
+        self.bases = bases.astype(np.float32)
+        self.perm = perm
+        self.resid_ldr_dict = resid_ldr_dict
+        self.var_dict = self._get_var()
+        self.vset_set_dict = self._get_vset_set()
+        self.half_ldr_score_dict = self._compute_sumstats()
 
     def _variant_set_test(self):
         """
@@ -175,7 +174,7 @@ class RVsimulation:
 
         return sig_count
     
-    def run(self):
+    def run(self, sample_id):
         """
         The main function for doing simulation
 
@@ -186,10 +185,12 @@ class RVsimulation:
             for cmac_bin, sig_count_list in sig_count_dict.items():
                 bin_sig_count_dict[cmac_bin].extend(sig_count_list)
 
+        bin_sig_count_dict_ = dict()
         for cmac_bin, sig_count_list in bin_sig_count_dict.items():
-            bin_sig_count_dict[cmac_bin] = np.mean(sig_count_list)
+            cmac_bin_str = "_".join([str(x) for x in cmac_bin])
+            bin_sig_count_dict_[cmac_bin_str] = np.mean(sig_count_list)
 
-        return pd.DataFrame(bin_sig_count_dict)
+        return pd.DataFrame(bin_sig_count_dict_, index=[sample_id])
     
 
 def creating_mask_null(mac_dict, cmac_bins_count=50000):
@@ -210,13 +211,14 @@ def creating_mask_null(mac_dict, cmac_bins_count=50000):
     cmac_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
                  (10,11), (12,14), (15,20), (21,30), (31,60), 
                  (61,100), (101,500), (501,1000)]
-    n_variants_list = np.array([len(mac_dict[chr]) for chr in range(1, 23)])
+    n_variants_list = np.array([len(mac) for _, mac in mac_dict.items()])
+    chr_list = list(mac_dict.keys())
     n_genes_chr_list = (n_variants_list / np.sum(n_variants_list) * cmac_bins_count).astype(int)
 
-    for chr in range(1, 23):
+    for i, chr in enumerate(chr_list):
         mac = mac_dict[chr]
-        n_variants = n_variants_list[chr-1]
-        n_genes = n_genes_chr_list[chr-1]
+        n_variants = n_variants_list[i]
+        n_genes = n_genes_chr_list[i]
         variant_idxs = np.arange(n_variants)
         gene_numeric_idxs = dict() 
         for bin in cmac_bins:
@@ -244,7 +246,7 @@ def creating_mask_null(mac_dict, cmac_bins_count=50000):
     return chr_gene_numeric_idxs
 
 
-def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=10000):
+def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=100):
     """
     Creating masks for power evaluation
 
@@ -263,14 +265,15 @@ def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=10000):
     cmac_bins = [(2,2), (3,3), (4,4), (5,5), (6,7), (8,9),
                  (10,11), (12,14), (15,20), (21,30), (31,60), 
                  (61,100), (101,500), (501,1000)]
-    n_variants_list = np.array([len(mac_dict[chr]) for chr in range(1, 23)])
+    n_variants_list = np.array([len(mac) for mac in mac_dict.items()])
+    chr_list = list(mac_dict.keys())
     n_genes_chr_list = (n_variants_list / np.sum(n_variants_list) * cmac_bins_count).astype(int)
 
-    for chr in range(1, 23):
+    for i, chr in enumerate(chr_list):
         mac = mac_dict[chr]
+        n_variants = n_variants_list[i]
+        n_genes = n_genes_chr_list[i]
         causal_idxs = causal_idx_dict[chr]
-        n_variants = n_variants_list[chr-1]
-        n_genes = n_genes_chr_list[chr-1]
         variant_idxs = np.arange(n_variants)
         gene_numeric_idxs = dict() 
         for bin in cmac_bins:
@@ -311,13 +314,16 @@ def check_input(args):
         raise ValueError("--null-model is required")
     if args.perm is None:
         raise ValueError("--perm is required")
-    args.sparse_genotype = ds.parse_input(args.sparse_genotype)
     if args.causal_idx is not None:
-        args.causal_idx = ds.parse_input(args.causal_idx)
+        chr_list = list(range(1, 23, 2))
+    else:
+        chr_list = list(range(2, 23, 2))
+    
+    return chr_list
 
 
 def run(args, log):
-    check_input(args, log)
+    chr_list = check_input(args)
     try:
         # reading data and selecting LDRs
         log.info(f"Read null model from {args.null_model}")
@@ -328,11 +334,11 @@ def run(args, log):
         sparse_genotype_dict = dict()
         mac_dict = dict()
         maf_dict = dict()
-        rex_chr = re.compile("chr(\d+)")
         n_variants = 0
-        for sparse_genotype in args.sparse_genotype:
-            chr = int(rex_chr.findall(sparse_genotype)[0])
-            sparse_genotype = load_npz(sparse_genotype)
+
+        for chr in chr_list:
+            sparse_genotype_file = args.sparse_genotype.replace('@', str(chr))
+            sparse_genotype = load_npz(sparse_genotype_file)
             mac = np.squeeze(np.array(sparse_genotype.sum(axis=1)))
             maf = mac / sparse_genotype.shape[1] / 2
             n_variants += sparse_genotype.shape[0]
@@ -346,9 +352,9 @@ def run(args, log):
 
         if args.causal_idx is not None:
             causal_idx_dict = dict()
-            for causal_idx in args.causal_idx:
-                chr = int(rex_chr.findall(causal_idx)[0])
-                causal_idx_dict[chr] = np.loadtxt(causal_idx)
+            for chr in chr_list:
+                causal_idx_file = args.causal_idx.replace('@', str(chr))
+                causal_idx_dict[chr] = np.loadtxt(causal_idx_file)
         else:
             causal_idx_dict = None
 
@@ -387,22 +393,21 @@ def run(args, log):
 
         # adjust for sample relatedness
         resid_ldr_dict = dict()
-        for chr in range(1, 23):
+        for chr in chr_list:
             resid_ldr_dict[chr] = null_model.resid_ldr - loco_preds.data_reader(chr)
 
         # permutation
         rv_simulation = RVsimulation(
-            null_model, 
+            null_model.covar, 
             sparse_genotype_dict, 
             chr_gene_numeric_idxs, 
             maf_dict, 
-            mac_dict, 
-            perm,
+            mac_dict,
             2.5e-6,
-            resid_ldr_dict
         )
 
-        bin_sig_count = rv_simulation.run()
+        rv_simulation.get_image_specific(null_model.bases, perm, resid_ldr_dict)
+        bin_sig_count = rv_simulation.run(0)
 
         out_path = f"{args.out}.txt"
         bin_sig_count.to_csv(out_path, sep='\t', index=None)
