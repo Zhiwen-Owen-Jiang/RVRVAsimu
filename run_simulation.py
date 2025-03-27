@@ -4,6 +4,7 @@ import time
 import argparse
 import numpy as np
 import pandas as pd
+from functools import wraps
 from collections import defaultdict
 from scipy.sparse import load_npz
 
@@ -264,7 +265,7 @@ def creating_mask_null(mac_dict, cmac_bins_count=50000):
 
 
 @log_execution_time
-def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=10000):
+def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=50000):
     """
     Creating masks for power evaluation
 
@@ -302,22 +303,22 @@ def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=10000):
         for mac_i, x in enumerate(mac):
             mac_positions[x].append(mac_i)
 
+        ## get a dict of causal mac-position
+        causal_mac_positions = defaultdict(list)
+        for idx in causal_idxs:
+            causal_mac_positions[mac[idx]].append(idx)
+
         gene_numeric_idxs = dict() 
         for bin in cmac_bins:
             output = list()
             while True:
-                upper_bound = bin[0] if bin[0] < 50 else int(bin[0] * 0.5)
-                n_causal_variants = np.random.choice(list(range(1, upper_bound)), 1)[0]
-                while True:
-                    causal_variants = np.random.choice(causal_idxs, n_causal_variants)
-                    causal_variants_cmac = np.sum(mac[causal_variants])
-                    if causal_variants_cmac < bin[0]:
-                        break
+                upper_bound = bin[0] if bin[0] < 50 else int(bin[0] * 0.8)
+                causal_variants_cmac = np.random.choice(list(range(1, upper_bound)), 1)[0]
+                causal_variants = select_variants_for_cmac(causal_mac_positions, causal_variants_cmac)
                 n_added = 0
                 while n_added < 10:
                     non_causal_variants_cmac = np.random.choice(list(range(bin[0], bin[1]+1)), 1)[0]
                     non_causal_variants_cmac -= causal_variants_cmac
-                    assert non_causal_variants_cmac > 0
                     non_causal_variants = select_variants_for_cmac(mac_positions, non_causal_variants_cmac)
                     selected_variants = np.concatenate([non_causal_variants, causal_variants])
                     assert bin[0] <= np.sum(mac[selected_variants]) <= bin[1]
@@ -349,7 +350,11 @@ def select_variants_for_cmac(mac_positions, cmac):
             current_cmac += mac_
             macs = macs[macs <= cmac - current_cmac]
 
-    return np.array([np.random.choice(mac_positions[mac], 1)[0] for mac in combo])
+    min_len = min([len(mac_positions[mac]) for mac in combo])
+    x = np.random.uniform(0, 1)
+    i = int(min_len * x)
+    j = min(i + 20, min_len)
+    return np.array([np.random.choice(mac_positions[mac][i:j], 1)[0] for mac in combo])
 
 
 def check_input(args):
