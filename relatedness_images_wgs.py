@@ -45,7 +45,7 @@ class Simulation:
     Simulating phenotypes with relatedness and population stratification
     
     """
-    def __init__(self, heri, snps_array, rare_snps_array, population, a=1.8, w=0.8):
+    def __init__(self, heri, snps_array, rare_snps_array, population, a=1.8, w=0.8, skewed=False):
         """
         heri: a float number between 0 and 1 of heritability of rare variants (0.01 or 0.05)
         snps_array (n, m): a np.array of causal variants (centered and normalized)
@@ -53,6 +53,7 @@ class Simulation:
         population: a pd.DataFrame of FID, IID, and first PC (centered and normalized)
         a: decay rate of lambda, greater than 1. Currently it is only polynomial
         w: true signal proportion
+        skewed: if noise distribution is skewed
         
         """
         self.heri = heri
@@ -63,6 +64,7 @@ class Simulation:
         self.n_rare_snps = rare_snps_array.shape[1]
         self.a = a
         self.w = w
+        self.skewed = skewed
         self.logger = logging.getLogger(__name__)
 
         self._GetBase()
@@ -91,7 +93,10 @@ class Simulation:
         # self.theta = gvar_b
         self.theta = self.lam - rare_gvar_b - gvar_b
         self.theta[self.theta < 0] = 0
-        xi_eta = np.random.normal(0, 1, (self.n_subs, 100)) * np.sqrt(self.theta)
+        if not self.skewed:
+            xi_eta = np.random.normal(0, 1, (self.n_subs, 100)) * np.sqrt(self.theta)
+        else:
+            xi_eta = np.random.normal(0, 1, (self.n_subs, 100)) ** 2 / np.sqrt(2) * np.sqrt(self.theta)
         xi_eta -= np.mean(xi_eta, axis=0)
         self.eta = np.dot(xi_eta, self.bases.T)
 
@@ -171,7 +176,7 @@ class Simulation:
 
 
 def main(args):
-    input_dir = f'/work/users/o/w/owenjf/image_genetics/methods/bfiles/wgs_0325/causal_regions/{args.percent}percent'
+    input_dir = f'/work/users/o/w/owenjf/image_genetics/methods/bfiles/wgs_0325/{args.percent}percent'
     output_dir = '/work/users/o/w/owenjf/image_genetics/methods/simu_wgs_rel_0325/data'
 
     population = pd.read_csv(os.path.join(input_dir, f'ukb_cal_oddchr_cleaned_maf_gene_hwe_white_kinship0.05_{args.percent}percent_10ksub_20pc_merged.eigenvec'), 
@@ -180,16 +185,18 @@ def main(args):
     population[2] = (population[2] - np.mean(population[2])) / np.std(population[2])
 
     snps_array = np.load(os.path.join(input_dir, f'ukb_cal_oddchr_white_kinship0.05_{args.percent}percent_10ksub_10ksnp_merged_normed.npy'))
-    # snps_array = (snps_array - np.mean(snps_array, axis=0)) / np.std(snps_array, axis=0)
-
     rare_snps_array = np.load(os.path.join(input_dir, f'ukb_oddchr_rare_snps_causal{args.causal}_kinship0.05_{args.percent}percent_10ksub_merged_normed.npy'))
-    # rare_snps_array = (rare_snps_array - np.mean(rare_snps_array, axis=0)) / np.std(rare_snps_array, axis=0)
 
     heri = args.heri
     a = 1.8
     w = args.w
     v = args.v
     c = args.c
+    
+    if args.skewed:
+        dist = 'skewed'
+    else:
+        dist = 'normal'
 
     if ':' in c:
         start, end = [int(x) for x in c.split(':')]
@@ -197,12 +204,20 @@ def main(args):
         start = int(c)
         end = start
 
-    simulator = Simulation(heri=heri, snps_array=snps_array, rare_snps_array=rare_snps_array, population=population, a=a, w=w)
+    simulator = Simulation(
+        heri=heri, 
+        snps_array=snps_array, 
+        rare_snps_array=rare_snps_array, 
+        population=population, 
+        a=a, 
+        w=w, 
+        skewed=args.skewed
+    )
     
     for i in range(start, end+1):
         phenotype = simulator.GetSimuData()
-        phenotype.to_csv(os.path.join(output_dir, f'images_rare_snps_kinship0.05_{args.percent}percent_10ksub_causal{args.causal}_heri{heri}_a{a}_w{w}_100voxels_v{v}_c{i}.txt'), sep='\t', index=None)
-        print(os.path.join(output_dir, f'images_rare_snps_kinship0.05_{args.percent}percent_10ksub_causal{args.causal}_heri{heri}_a{a}_w{w}_100voxels_v{v}_c{i}.txt'))
+        phenotype.to_csv(os.path.join(output_dir, f'images_rare_snps_kinship0.05_{args.percent}percent_10ksub_causal{args.causal}_heri{heri}_a{a}_w{w}_{dist}_100voxels_v{v}_c{i}.txt'), sep='\t', index=None)
+        print(os.path.join(output_dir, f'images_rare_snps_kinship0.05_{args.percent}percent_10ksub_causal{args.causal}_heri{heri}_a{a}_w{w}_{dist}_100voxels_v{v}_c{i}.txt'))
 
 
 parser = argparse.ArgumentParser()
@@ -212,6 +227,7 @@ parser.add_argument('-c', help='which replicate it is')
 parser.add_argument('-w', type=float, help='signal to noise ratio')
 parser.add_argument('--percent', help='relatedness percentage')
 parser.add_argument('--causal', help='causal variant percentage')
+parser.add_argument('--skewed', action='store_true', help='if the voxel distribution is skewed')
 
 
 if __name__ == '__main__':
