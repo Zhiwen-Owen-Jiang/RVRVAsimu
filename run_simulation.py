@@ -4,6 +4,7 @@ import time
 import argparse
 import numpy as np
 import pandas as pd
+from datetime import datetime
 from functools import wraps
 from collections import defaultdict
 from scipy.sparse import load_npz
@@ -350,11 +351,15 @@ def select_variants_for_cmac(mac_positions, cmac):
             current_cmac += mac_
             macs = macs[macs <= cmac - current_cmac]
 
-    min_len = min([len(mac_positions[mac]) for mac in combo])
-    x = np.random.uniform(0, 1)
-    i = int(min_len * x)
-    j = min(i + 20, min_len)
-    return np.array([np.random.choice(mac_positions[mac][i:j], 1)[0] for mac in combo])
+    selected_variants = list()
+    for mac in combo:
+        n_variants = len(mac_positions[mac])
+        x = np.random.uniform(0, 1)
+        i = int(n_variants * x)
+        j = min(i + 20, n_variants)
+        selected_variants.append(np.random.choice(mac_positions[mac][i:j], 1)[0])
+
+    return np.array(selected_variants)
 
 
 def check_input(args):
@@ -460,7 +465,12 @@ def run(args, log):
         bin_sig_count = rv_simulation.run(0)
 
         out_path = f"{args.out}.txt"
-        bin_sig_count.to_csv(out_path, sep='\t', index=None)
+        # bin_sig_count.to_csv(out_path, sep='\t', index=None)
+        bin_sig_count = bin_sig_count.to_csv(sep='\t', index=None, header=None)
+        current_time = str(datetime.now())
+        with open(out_path, 'a') as file:
+            file.write(f"{current_time}\t{bin_sig_count}")
+            
         log.info(f"\nSave results to {args.out}.txt")
 
     finally:
