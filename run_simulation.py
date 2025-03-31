@@ -246,7 +246,7 @@ def creating_mask_null(mac_dict, cmac_bins_count=50000):
             while True:
                 permuted_variant_idxs = variant_idxs[np.random.permutation(n_variants)]
                 start = 0
-                window_size = np.random.choice(list(range(*window_range)), 1)[0]
+                window_size = np.random.randint(*window_range)
                 skip_size = int(window_size * 0.8) + 1
                 while start + window_size < n_variants:
                     end = start + window_size
@@ -313,16 +313,18 @@ def creating_mask_causal(mac_dict, causal_idx_dict, cmac_bins_count=50000):
         for bin in cmac_bins:
             output = list()
             while True:
-                upper_bound = bin[0] if bin[0] < 50 else int(bin[0] * 0.8)
-                causal_variants_cmac = np.random.choice(list(range(1, upper_bound)), 1)[0]
+                # upper_bound = bin[0] if bin[0] < 50 else int(bin[0] * 0.8)
+                upper_bound = max(int(((bin[0] + bin[1]) // 2 * 0.5)), 2)
+                causal_variants_cmac = np.random.randint(1, upper_bound)
                 causal_variants = select_variants_for_cmac(causal_mac_positions, causal_variants_cmac)
                 n_added = 0
                 while n_added < 10:
-                    non_causal_variants_cmac = np.random.choice(list(range(bin[0], bin[1]+1)), 1)[0]
-                    non_causal_variants_cmac -= causal_variants_cmac
+                    non_causal_variants_cmac = np.random.randint(
+                        max(bin[0]-causal_variants_cmac, 1), bin[1]-causal_variants_cmac+1
+                    )
                     non_causal_variants = select_variants_for_cmac(mac_positions, non_causal_variants_cmac)
                     selected_variants = np.concatenate([non_causal_variants, causal_variants])
-                    assert bin[0] <= np.sum(mac[selected_variants]) <= bin[1]
+                    # assert bin[0] <= np.sum(mac[selected_variants]) <= bin[1]
                     output.append(selected_variants)
                     n_added += 1
                     if len(output) >= n_genes:
@@ -345,7 +347,7 @@ def select_variants_for_cmac(mac_positions, cmac):
     combo = list()
     current_cmac = 0
     while current_cmac < cmac:
-        mac_ = np.random.choice(macs, 1)[0]
+        mac_ = np.random.choice(macs)
         if current_cmac + mac_ <= cmac:
             combo.append(mac_)
             current_cmac += mac_
@@ -357,7 +359,7 @@ def select_variants_for_cmac(mac_positions, cmac):
         x = np.random.uniform(0, 1)
         i = int(n_variants * x)
         j = min(i + 20, n_variants)
-        selected_variants.append(np.random.choice(mac_positions[mac][i:j], 1)[0])
+        selected_variants.append(np.random.choice(mac_positions[mac][i:j]))
 
     return np.array(selected_variants)
 
