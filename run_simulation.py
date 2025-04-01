@@ -451,7 +451,10 @@ def run(args, log):
         # adjust for sample relatedness
         resid_ldr_dict = dict()
         for chr in chr_list:
-            resid_ldr_dict[chr] = null_model.resid_ldr - loco_preds.data_reader(chr)
+            if args.loco_preds is not None:
+                resid_ldr_dict[chr] = null_model.resid_ldr - loco_preds.data_reader(chr)
+            else:
+                resid_ldr_dict[chr] = null_model.resid_ldr
 
         # simulation
         rv_simulation = RVsimulation(
