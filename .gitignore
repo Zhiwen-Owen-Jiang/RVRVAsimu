@@ -1,0 +1,4 @@
+.vscode/
+test_data_generation.ipynb
+__pycache__/
+internal_test/
